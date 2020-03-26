@@ -251,6 +251,7 @@ namespace Microsoft.Tye.Hosting
                 new EventPipeDiagnosticsRunner(logger, diagnosticsCollector),
                 new ProxyService(logger),
                 new DockerRunner(logger),
+                new SharedConfigurationRunner(logger, SharedConfigurationOptions.FromArgs(args)),
                 new ProcessRunner(logger, ProcessRunnerOptions.FromArgs(args)),
             };
 

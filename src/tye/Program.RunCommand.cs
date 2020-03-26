@@ -21,6 +21,12 @@ namespace Microsoft.Tye
                 CommonArguments.Path_Required,
             };
 
+            command.AddOption(new Option("--share-configs")
+            {
+                Description = "Shares configurations to services using the TyeConfigurationProvider",
+                Required = false,
+            });
+
             // TODO: We'll need to support a --build-args
             command.AddOption(new Option("--no-build")
             {
