@@ -22,7 +22,7 @@ namespace Microsoft.Tye.Hosting
             _logger = logger;
         }
 
-        public Task StartAsync(Tye.Hosting.Model.Application application)
+        public Task StartAsync(Application application)
         {
             var tasks = new Task[application.Services.Count];
             var index = 0;
@@ -34,7 +34,7 @@ namespace Microsoft.Tye.Hosting
             return Task.WhenAll(tasks);
         }
 
-        public Task StopAsync(Tye.Hosting.Model.Application application)
+        public Task StopAsync(Application application)
         {
             var services = application.Services;
 
@@ -49,7 +49,7 @@ namespace Microsoft.Tye.Hosting
             return Task.WhenAll(tasks);
         }
 
-        private async Task StartContainerAsync(Tye.Hosting.Model.Application application, Tye.Hosting.Model.Service service, DockerRunInfo docker)
+        private async Task StartContainerAsync(Application application, Service service, DockerRunInfo docker)
         {
             if (!await DockerDetector.Instance.IsDockerInstalled.Value)
             {
@@ -83,7 +83,7 @@ namespace Microsoft.Tye.Hosting
 
             var dockerInfo = new DockerInformation(new Task[service.Description.Replicas]);
 
-            async Task RunDockerContainer(IEnumerable<(int Port, int? InternalPort, int BindingPort, string? Protocol)> ports)
+            async Task RunDockerContainer(IEnumerable<(int Port, int? ContainerPort, int BindingPort, string? Protocol)> ports)
             {
                 var hasPorts = ports.Any();
 
@@ -110,10 +110,10 @@ namespace Microsoft.Tye.Hosting
                     // These are the ports that the application should use for binding
 
                     // 1. Tell the docker container what port to bind to
-                    portString = string.Join(" ", ports.Select(p => $"-p {p.Port}:{p.InternalPort ?? p.Port}"));
+                    portString = string.Join(" ", ports.Select(p => $"-p {p.Port}:{p.ContainerPort ?? p.Port}"));
 
                     // 2. Configure ASP.NET Core to bind to those same ports
-                    environment["ASPNETCORE_URLS"] = string.Join(";", ports.Select(p => $"{p.Protocol ?? "http"}://*:{p.InternalPort ?? p.Port}"));
+                    environment["ASPNETCORE_URLS"] = string.Join(";", ports.Select(p => $"{p.Protocol ?? "http"}://*:{p.ContainerPort ?? p.Port}"));
 
                     // Set the HTTPS port for the redirect middleware
                     foreach (var p in ports)
@@ -126,9 +126,13 @@ namespace Microsoft.Tye.Hosting
                     }
 
                     // 3. For non-ASP.NET Core apps, pass the same information in the PORT env variable as a semicolon separated list.
-                    environment["PORT"] = string.Join(";", ports.Select(p => $"{p.InternalPort ?? p.Port}"));
+                    environment["PORT"] = string.Join(";", ports.Select(p => $"{p.ContainerPort ?? p.Port}"));
                 }
 
+                // See: https://github.com/docker/for-linux/issues/264
+                //
+                // The way we do proxying here doesn't really work for multi-container scenarios on linux
+                // without some more setup.
                 application.PopulateEnvironment(service, (key, value) => environment[key] = value, "host.docker.internal");
 
                 environment["APP_INSTANCE"] = replica;
@@ -239,7 +243,7 @@ namespace Microsoft.Tye.Hosting
                             continue;
                         }
 
-                        ports.Add((service.PortMap[binding.Port.Value][i], binding.InternalPort, binding.Port.Value, binding.Protocol));
+                        ports.Add((service.PortMap[binding.Port.Value][i], binding.ContainerPort, binding.Port.Value, binding.Protocol));
                     }
 
                     dockerInfo.Tasks[i] = RunDockerContainer(ports);
@@ -256,7 +260,7 @@ namespace Microsoft.Tye.Hosting
             service.Items[typeof(DockerInformation)] = dockerInfo;
         }
 
-        private static void PrintStdOutAndErr(Tye.Hosting.Model.Service service, string replica, ProcessResult result)
+        private static void PrintStdOutAndErr(Service service, string replica, ProcessResult result)
         {
             if (result.ExitCode != 0)
             {
@@ -272,7 +276,7 @@ namespace Microsoft.Tye.Hosting
             }
         }
 
-        private async Task StopContainerAsync(Tye.Hosting.Model.Service service)
+        private async Task StopContainerAsync(Service service)
         {
             if (service.Items.TryGetValue(typeof(DockerInformation), out var value) && value is DockerInformation di)
             {

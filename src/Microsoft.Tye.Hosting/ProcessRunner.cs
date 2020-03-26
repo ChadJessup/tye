@@ -4,31 +4,29 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Tye.Hosting.Model;
 using Microsoft.Extensions.Logging;
-using System.Diagnostics;
+using Microsoft.Tye.Hosting.Model;
 
 namespace Microsoft.Tye.Hosting
 {
     public class ProcessRunner : IApplicationProcessor
     {
         private readonly ILogger _logger;
-        private readonly bool _debugMode;
-        private readonly bool _buildProjects;
+        private readonly ProcessRunnerOptions _options;
 
         public ProcessRunner(ILogger logger, ProcessRunnerOptions options)
         {
             _logger = logger;
-            _debugMode = options.DebugMode;
-            _buildProjects = options.BuildProjects;
+            _options = options;
         }
 
-        public Task StartAsync(Tye.Hosting.Model.Application application)
+        public Task StartAsync(Application application)
         {
             var tasks = new Task[application.Services.Count];
             var index = 0;
@@ -36,25 +34,22 @@ namespace Microsoft.Tye.Hosting
             {
                 tasks[index++] = s.Value.ServiceType switch
                 {
-                    ServiceType.Container => Task.CompletedTask,
-                    ServiceType.External => Task.CompletedTask,
-
                     ServiceType.Executable => LaunchService(application, s.Value),
                     ServiceType.Project => LaunchService(application, s.Value),
 
-                    _ => throw new InvalidOperationException("Unknown ServiceType."),
+                    _ => Task.CompletedTask,
                 };
             }
 
             return Task.WhenAll(tasks);
         }
 
-        public Task StopAsync(Tye.Hosting.Model.Application application)
+        public Task StopAsync(Application application)
         {
             return KillRunningProcesses(application.Services);
         }
 
-        private async Task LaunchService(Tye.Hosting.Model.Application application, Tye.Hosting.Model.Service service)
+        private async Task LaunchService(Application application, Service service)
         {
             var serviceDescription = service.Description;
             var serviceName = serviceDescription.Name;
@@ -65,22 +60,15 @@ namespace Microsoft.Tye.Hosting
 
             if (serviceDescription.RunInfo is ProjectRunInfo project)
             {
-                var expandedProject = Environment.ExpandEnvironmentVariables(project.Project);
-                var fullProjectPath = Path.GetFullPath(Path.Combine(application.ContextDirectory, expandedProject));
-                path = GetExePath(fullProjectPath);
-                workingDirectory = Path.GetDirectoryName(fullProjectPath)!;
-                args = project.Args ?? "";
-                service.Status.ProjectFilePath = fullProjectPath;
+                path = project.RunCommand;
+                workingDirectory = project.ProjectFile.Directory.FullName;
+                args = project.Args == null ? project.RunArguments : project.RunArguments + " " + project.Args;
+                service.Status.ProjectFilePath = project.ProjectFile.FullName;
             }
             else if (serviceDescription.RunInfo is ExecutableRunInfo executable)
             {
-                var expandedExecutable = Environment.ExpandEnvironmentVariables(executable.Executable);
-                path = Path.GetExtension(expandedExecutable) == ".dll" ?
-                    Path.GetFullPath(Path.Combine(application.ContextDirectory, expandedExecutable)) :
-                    expandedExecutable;
-                workingDirectory = executable.WorkingDirectory != null ?
-                    Path.GetFullPath(Path.Combine(application.ContextDirectory, Environment.ExpandEnvironmentVariables(executable.WorkingDirectory))) :
-                    Path.GetDirectoryName(path)!;
+                path = executable.Executable;
+                workingDirectory = executable.WorkingDirectory!;
                 args = executable.Args ?? "";
             }
             else
@@ -100,10 +88,11 @@ namespace Microsoft.Tye.Hosting
             service.Status.Args = args;
 
             var processInfo = new ProcessInfo(new Task[service.Description.Replicas]);
+
             if (service.Status.ProjectFilePath != null &&
                 service.Description.RunInfo is ProjectRunInfo project2 &&
                 project2.Build &&
-                _buildProjects)
+                _options.BuildProjects)
             {
                 // Sometimes building can fail because of file locking (like files being open in VS)
                 _logger.LogInformation("Building project {ProjectFile}", service.Status.ProjectFilePath);
@@ -146,7 +135,7 @@ namespace Microsoft.Tye.Hosting
 
                 application.PopulateEnvironment(service, (k, v) => environment[k] = v);
 
-                if (_debugMode)
+                if (_options.DebugMode && (_options.DebugAllServices || _options.ServicesToDebug.Contains(serviceName, StringComparer.OrdinalIgnoreCase)))
                 {
                     environment["DOTNET_STARTUP_HOOKS"] = typeof(Hosting.Runtime.HostingRuntimeHelpers).Assembly.Location;
                 }
@@ -231,7 +220,14 @@ namespace Microsoft.Tye.Hosting
                     {
                         _logger.LogError(0, ex, "Failed to launch process for service {ServiceName}", replica);
 
-                        Thread.Sleep(5000);
+                        try
+                        {
+                            await Task.Delay(5000, processInfo.StoppedTokenSource.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // Swallow cancellation exceptions and continue
+                        }
                     }
 
                     service.Restarts++;
@@ -278,9 +274,9 @@ namespace Microsoft.Tye.Hosting
             service.Items[typeof(ProcessInfo)] = processInfo;
         }
 
-        private Task KillRunningProcesses(IDictionary<string, Tye.Hosting.Model.Service> services)
+        private Task KillRunningProcesses(IDictionary<string, Service> services)
         {
-            static async Task KillProcessAsync(Tye.Hosting.Model.Service service)
+            static async Task KillProcessAsync(Service service)
             {
                 if (service.Items.TryGetValue(typeof(ProcessInfo), out var stateObj) && stateObj is ProcessInfo state)
                 {
@@ -300,32 +296,6 @@ namespace Microsoft.Tye.Hosting
             }
 
             return Task.WhenAll(tasks);
-        }
-
-        private static string GetExePath(string projectFilePath)
-        {
-            // TODO: Use msbuild to get the target path
-
-            var outputFileName = Path.GetFileNameWithoutExtension(projectFilePath) + (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ".exe" : ".dll");
-
-            var debugOutputPath = Path.Combine(Path.GetDirectoryName(projectFilePath)!, "bin", "Debug");
-
-            var tfms = Directory.Exists(debugOutputPath) ? Directory.GetDirectories(debugOutputPath) : Array.Empty<string>();
-
-            if (tfms.Length > 0)
-            {
-                // Pick the first one
-                var path = Path.Combine(debugOutputPath, tfms[0], outputFileName);
-                if (File.Exists(path))
-                {
-                    return path;
-                }
-
-                // Older versions of .NET Core didn't have TFMs
-                return Path.Combine(debugOutputPath, tfms[0], Path.GetFileNameWithoutExtension(projectFilePath) + ".dll");
-            }
-
-            return Path.Combine(debugOutputPath, "netcoreapp3.1", outputFileName);
         }
 
         private static string? GetDotnetRoot()
